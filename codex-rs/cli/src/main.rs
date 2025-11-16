@@ -396,6 +396,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+    // GravityCode: Initialize INS extensions (if embedded)
+    if let Err(e) = codex_cli::gravitycode_init::initialize_gravitycode() {
+        eprintln!("⚠️  GravityCode initialization failed: {}", e);
+    }
+
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,

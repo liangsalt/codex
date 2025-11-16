@@ -2,6 +2,9 @@ pub mod debug_sandbox;
 mod exit_status;
 pub mod login;
 
+// GravityCode: INS extensions initialization
+pub mod gravitycode_init;
+
 use clap::Parser;
 use codex_common::CliConfigOverrides;
 
