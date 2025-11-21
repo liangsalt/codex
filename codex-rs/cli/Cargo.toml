@@ -35,11 +35,18 @@ codex-rmcp-client = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 codex-tui = { workspace = true }
 ctor = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 libc = { workspace = true }
 owo-colors = { workspace = true }
+rand = { workspace = true }
 regex-lite = { workspace = true}
+sha2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 supports-color = { workspace = true }
+thiserror = { workspace = true }
+once_cell = "1.19"
+time = { workspace = true, features = ["formatting", "parsing"] }
 toml = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
@@ -49,16 +56,34 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tracing = { workspace = true }
+whoami = { workspace = true }
 
 # GravityCode: INS extensions embedding
 include_dir = "0.7"
 dirs = "5.0"
+aes = "0.8"
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = { version = "0.4", features = ["alloc"] }
+hex = "0.4"
+hostname = "0.4"
+num_cpus = "1.16"
+scrypt = "0.11"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 
 [build-dependencies]
 include_dir = "0.7"
+anyhow = { workspace = true }
+aes = "0.8"
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = { version = "0.4", features = ["alloc"] }
+rand = { workspace = true }
+scrypt = "0.11"
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -9,6 +9,7 @@ use codex_chatgpt::apply_command::run_apply_command;
 use codex_cli::LandlockCommand;
 use codex_cli::SeatbeltCommand;
 use codex_cli::WindowsCommand;
+use codex_cli::gravitycode_license::LicenseManager;
 use codex_cli::login::read_api_key_from_stdin;
 use codex_cli::login::run_login_status;
 use codex_cli::login::run_login_with_api_key;
@@ -396,6 +397,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+    // GravityCode: Enforce license before any extension initialization.
+    let license_manager = LicenseManager::new()?;
+    if let Err(err) = license_manager.ensure_active().await {
+        eprintln!("❌ GravityCode license 校验失败: {err}");
+        return Err(err);
+    }
+
     // GravityCode: Initialize INS extensions (if embedded)
     if let Err(e) = codex_cli::gravitycode_init::initialize_gravitycode() {
         eprintln!("⚠️  GravityCode initialization failed: {}", e);

@@ -4,6 +4,7 @@ pub mod login;
 
 // GravityCode: INS extensions initialization
 pub mod gravitycode_init;
+pub mod gravitycode_license;
 
 use clap::Parser;
 use codex_common::CliConfigOverrides;
