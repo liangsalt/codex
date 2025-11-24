@@ -30,7 +30,6 @@ use std::time::UNIX_EPOCH;
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::runtime::Runtime;
 
 const ACCOUNT_ID: &str = "e0c011c3-8b88-496c-ab5a-06d0d2a01ccf";
 const PRODUCT_ID: &str = "555cf493-b2a9-4219-a6ba-7f7b0e9854b9";
@@ -40,12 +39,20 @@ const REQUEST_TIMEOUT_MS: i64 = 10_000;
 
 const ACTIVATION_VERSION: i32 = 1;
 const ACTIVATION_FILE: &str = "activation.dat";
-const ACTIVATION_DIR: &str = "gravitycode-license";
+const PRODUCT_ACTIVATION_DIR: &str = "gravitycode-license";
+const EXT_ACTIVATION_DIR: &str = "gravitycode-ext-license";
 const KDF_SALT: &str = "gravitycode-license-kdf-v1";
 
 pub struct LicenseManager {
     http: reqwest::Client,
     home: PathBuf,
+    scope: LicenseScope,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LicenseScope {
+    Product,
+    Extension,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +192,14 @@ struct MachineRelationshipLicenseData {
 
 impl LicenseManager {
     pub fn new() -> Result<Self> {
+        Self::with_scope(LicenseScope::Product)
+    }
+
+    pub fn new_for_extension() -> Result<Self> {
+        Self::with_scope(LicenseScope::Extension)
+    }
+
+    fn with_scope(scope: LicenseScope) -> Result<Self> {
         let timeout = Duration::from_millis(REQUEST_TIMEOUT_MS as u64);
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -193,16 +208,33 @@ impl LicenseManager {
 
         let home = get_codex_home()?;
 
-        Ok(Self { http, home })
+        Ok(Self { http, home, scope })
     }
 
     pub async fn ensure_active(&self) -> Result<ActiveLicense> {
         let fingerprint = compute_fingerprint()?;
-        let storage_dir = self.home.join(ACTIVATION_DIR);
-        fs::create_dir_all(&storage_dir).context("创建 license 存储目录失败")?;
-        let activation_path = storage_dir.join(ACTIVATION_FILE);
 
-        if let Some(payload) = self.load_activation(&activation_path, &fingerprint)? {
+        // Test/dev bypass to run without prompting for product key.
+        if license_bypass_enabled() {
+            return Ok(ActiveLicense {
+                license_id: "bypass".to_string(),
+                machine_id: None,
+                expires_at: None,
+                last_validated_ms: now_ms(),
+                fingerprint,
+            });
+        }
+
+        let activation_path = self.activation_path();
+        if let Some(dir) = activation_path.parent() {
+            fs::create_dir_all(dir).context("创建 license 存储目录失败")?;
+        }
+
+        if let Some(payload) = self.load_activation(
+            &activation_path,
+            &fingerprint,
+            /*expected_license_key=*/ None,
+        )? {
             let now_ms = now_ms();
             let elapsed = now_ms.saturating_sub(payload.last_validated_ms);
             if elapsed <= GRACE_PERIOD_MS {
@@ -211,7 +243,8 @@ impl LicenseManager {
 
             let refreshed = self
                 .validate_online(&payload.license_key, &fingerprint)
-                .await?;
+                .await
+                .map_err(|e| anyhow!("在线验证 license 失败: {e}"))?;
             self.save_activation(&activation_path, &fingerprint, &refreshed)?;
             return Ok(to_active(&refreshed, &fingerprint));
         }
@@ -220,20 +253,35 @@ impl LicenseManager {
         let activated = self
             .validate_online(&license_key, &fingerprint)
             .await
-            .context("在线验证 license 失败")?;
+            .map_err(|e| anyhow!("在线验证 license 失败: {e}"))?;
 
         self.save_activation(&activation_path, &fingerprint, &activated)?;
 
         Ok(to_active(&activated, &fingerprint))
     }
 
-    pub fn ensure_active_with_key(&self, license_key: &str) -> Result<ActiveLicense> {
+    pub async fn ensure_active_with_key_async(&self, license_key: &str) -> Result<ActiveLicense> {
         let fingerprint = compute_fingerprint()?;
-        let storage_dir = self.home.join(ACTIVATION_DIR);
-        fs::create_dir_all(&storage_dir).context("创建 license 存储目录失败")?;
-        let activation_path = storage_dir.join(ACTIVATION_FILE);
 
-        if let Some(payload) = self.load_activation(&activation_path, &fingerprint)? {
+        // Test/dev bypass to allow running CLI integration tests without a product key.
+        if license_bypass_enabled() {
+            return Ok(ActiveLicense {
+                license_id: "bypass".to_string(),
+                machine_id: None,
+                expires_at: None,
+                last_validated_ms: now_ms(),
+                fingerprint,
+            });
+        }
+
+        let activation_path = self.activation_path();
+        if let Some(dir) = activation_path.parent() {
+            fs::create_dir_all(dir).context("创建 license 存储目录失败")?;
+        }
+
+        if let Some(payload) =
+            self.load_activation(&activation_path, &fingerprint, Some(license_key))?
+        {
             let now_ms = now_ms();
             let elapsed = now_ms.saturating_sub(payload.last_validated_ms);
             if elapsed <= GRACE_PERIOD_MS {
@@ -241,10 +289,10 @@ impl LicenseManager {
             }
         }
 
-        let rt = Runtime::new().context("无法创建 tokio runtime")?;
-        let activated = rt
-            .block_on(self.validate_online(license_key, &fingerprint))
-            .context("在线验证 license 失败")?;
+        let activated = self
+            .validate_online(license_key, &fingerprint)
+            .await
+            .map_err(|e| anyhow!("在线验证 license 失败: {e}"))?;
 
         self.save_activation(&activation_path, &fingerprint, &activated)?;
 
@@ -256,75 +304,99 @@ impl LicenseManager {
         license_key: &str,
         fingerprint: &str,
     ) -> Result<ActivationPayload> {
-        let validate_url = format!(
-            "https://api.keygen.sh/v1/accounts/{}/licenses/actions/validate-key",
-            ACCOUNT_ID
-        );
+        let mut allow_machine_retry = true;
+        let mut cached_machine_id: Option<Option<String>> = None;
+        loop {
+            let validate_url = format!(
+                "https://api.keygen.sh/v1/accounts/{ACCOUNT_ID}/licenses/actions/validate-key"
+            );
 
-        let request_body = ValidateRequest {
-            meta: ValidateRequestMeta {
-                key: license_key.to_owned(),
-                scope: ValidateScope {
-                    fingerprint: fingerprint.to_owned(),
-                    product: PRODUCT_ID.to_owned(),
+            let request_body = ValidateRequest {
+                meta: ValidateRequestMeta {
+                    key: license_key.to_owned(),
+                    scope: ValidateScope {
+                        fingerprint: fingerprint.to_owned(),
+                        product: PRODUCT_ID.to_owned(),
+                    },
                 },
-            },
-        };
+            };
 
-        let response = self
-            .http
-            .post(validate_url)
-            .header("Accept", "application/vnd.api+json")
-            .header("Content-Type", "application/vnd.api+json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(map_network_error)?;
+            let response = self
+                .http
+                .post(validate_url)
+                .header("Accept", "application/vnd.api+json")
+                .header("Content-Type", "application/vnd.api+json")
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(map_network_error)?;
 
-        let status = response.status();
-        let raw_body = response
-            .text()
-            .await
-            .map_err(map_network_error)
-            .context("读取 Keygen 响应失败")?;
-        let parsed: KeygenValidateResponse =
-            serde_json::from_str(&raw_body).context("解析 Keygen 验证响应失败")?;
+            let status = response.status();
+            let raw_body = response
+                .text()
+                .await
+                .map_err(map_network_error)
+                .context("读取 Keygen 响应失败")?;
+            let parsed: KeygenValidateResponse =
+                serde_json::from_str(&raw_body).context("解析 Keygen 验证响应失败")?;
 
-        if !status.is_success() || !parsed.meta.valid {
-            return Err(map_keygen_error(parsed.errors, parsed.meta.detail));
-        }
-
-        let data = parsed.data.context("Keygen 响应缺少 license 数据")?;
-
-        let attributes = data.attributes;
-        let status_str = attributes.status.to_uppercase();
-        if status_str == "SUSPENDED" || status_str == "BANNED" {
-            return Err(anyhow!(LicenseError::Suspended));
-        }
-
-        if let Some(expiry) = attributes.expiry.as_deref() {
-            let expiry_time = parse_rfc3339(expiry)?;
-            let expiry_ms = (expiry_time.unix_timestamp_nanos() / 1_000_000) as i64;
-            if expiry_ms < now_ms() {
-                return Err(anyhow!(LicenseError::Expired));
+            if !status.is_success() || !parsed.meta.valid {
+                // If the license is valid but fingerprint has no machine, create one and retry once.
+                if allow_machine_retry
+                    && is_machine_missing(&parsed.meta.detail, parsed.errors.as_deref())
+                    && parsed.data.is_some()
+                {
+                    if let Some(ref license) = parsed.data {
+                        let machine_id = self
+                            .create_machine(license_key, &license.id, fingerprint)
+                            .await?;
+                        cached_machine_id = Some(machine_id);
+                        allow_machine_retry = false;
+                        continue;
+                    }
+                }
+                return Err(map_keygen_error(parsed.errors, parsed.meta.detail));
             }
+
+            let data = parsed.data.context("Keygen 响应缺少 license 数据")?;
+            let license_id = data.id.clone();
+            let attributes = data.attributes;
+            let status_str = attributes.status.to_uppercase();
+            if status_str == "SUSPENDED" || status_str == "BANNED" {
+                return Err(anyhow!(LicenseError::Suspended));
+            }
+
+            if let Some(expiry) = attributes.expiry.as_deref() {
+                let expiry_time = parse_rfc3339(expiry)?;
+                let expiry_ms = (expiry_time.unix_timestamp_nanos() / 1_000_000) as i64;
+                if expiry_ms < now_ms() {
+                    return Err(anyhow!(LicenseError::Expired));
+                }
+            }
+
+            let machine_id = match cached_machine_id.clone() {
+                Some(Some(mid)) => mid,
+                Some(None) => {
+                    return Err(anyhow!(LicenseError::FingerprintMismatch));
+                }
+                None => self
+                    .create_machine(license_key, &license_id, fingerprint)
+                    .await?
+                    .ok_or_else(|| anyhow!(LicenseError::FingerprintMismatch))?,
+            };
+
+            let payload = ActivationPayload {
+                license_key: license_key.to_owned(),
+                license_id,
+                machine_id: Some(machine_id),
+                fingerprint: fingerprint.to_owned(),
+                expires_at: attributes.expiry,
+                last_validated_ms: now_ms(),
+                activation_version: ACTIVATION_VERSION,
+            };
+
+            return Ok(payload);
         }
-
-        let machine_id = self
-            .create_machine(license_key, &data.id, fingerprint)
-            .await?;
-
-        let payload = ActivationPayload {
-            license_key: license_key.to_owned(),
-            license_id: data.id,
-            machine_id,
-            fingerprint: fingerprint.to_owned(),
-            expires_at: attributes.expiry,
-            last_validated_ms: now_ms(),
-            activation_version: ACTIVATION_VERSION,
-        };
-
-        Ok(payload)
     }
 
     async fn create_machine(
@@ -333,7 +405,7 @@ impl LicenseManager {
         license_id: &str,
         fingerprint: &str,
     ) -> Result<Option<String>> {
-        let url = format!("https://api.keygen.sh/v1/accounts/{}/machines", ACCOUNT_ID);
+        let url = format!("https://api.keygen.sh/v1/accounts/{ACCOUNT_ID}/machines");
 
         let host = hostname::get()
             .ok()
@@ -380,7 +452,7 @@ impl LicenseManager {
         if status.is_success() {
             let data: serde_json::Value =
                 serde_json::from_str(&raw_body).context("解析 machine 创建响应失败")?;
-            let id = data["data"]["id"].as_str().map(|s| s.to_string());
+            let id = data["data"]["id"].as_str().map(str::to_string);
             return Ok(id);
         }
 
@@ -388,9 +460,11 @@ impl LicenseManager {
             if raw_body.contains("fingerprint has already been taken")
                 || raw_body.contains("fingerprint is already in use")
             {
-                return Ok(None);
+                return Err(anyhow!(LicenseError::FingerprintMismatch));
             }
-            if raw_body.contains("maximum number of machines") {
+            if raw_body.contains("maximum number of machines")
+                || raw_body.contains("machine count has exceeded maximum")
+            {
                 return Err(anyhow!(LicenseError::MaxMachinesExceeded));
             }
         }
@@ -400,7 +474,12 @@ impl LicenseManager {
         ))))
     }
 
-    fn load_activation(&self, path: &Path, fingerprint: &str) -> Result<Option<ActivationPayload>> {
+    fn load_activation(
+        &self,
+        path: &Path,
+        fingerprint: &str,
+        expected_license_key: Option<&str>,
+    ) -> Result<Option<ActivationPayload>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -429,6 +508,12 @@ impl LicenseManager {
             return Ok(None);
         }
 
+        if let Some(expected) = expected_license_key {
+            if payload.license_key != expected {
+                return Ok(None);
+            }
+        }
+
         Ok(Some(payload))
     }
 
@@ -439,7 +524,7 @@ impl LicenseManager {
         payload: &ActivationPayload,
     ) -> Result<()> {
         let key = derive_key(fingerprint)?;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut iv = [0u8; 16];
         rng.fill_bytes(&mut iv);
 
@@ -537,6 +622,14 @@ fn compute_fingerprint() -> Result<String> {
     Ok(hex::encode(digest))
 }
 
+fn license_bypass_enabled() -> bool {
+    cfg!(test)
+        || matches!(
+            env::var("GRAVITYCODE_LICENSE_BYPASS").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+}
+
 fn get_codex_home() -> Result<PathBuf> {
     if let Ok(home) = env::var("CODEX_HOME") {
         Ok(PathBuf::from(home))
@@ -556,6 +649,31 @@ fn now_ms() -> i64 {
 
 fn parse_rfc3339(input: &str) -> Result<OffsetDateTime> {
     OffsetDateTime::parse(input, &Rfc3339).map_err(|e| anyhow!("时间解析失败: {e}"))
+}
+
+fn is_machine_missing(detail: &Option<String>, errors: Option<&[KeygenError]>) -> bool {
+    let matches_text = |text: &str| {
+        let t = text.to_ascii_lowercase();
+        t.contains("no associated machine")
+            || t.contains("no associated machines")
+            || (t.contains("not activated") && t.contains("machine"))
+            || (t.contains("fingerprint") && t.contains("machine") && t.contains("activate"))
+    };
+    if let Some(d) = detail {
+        if matches_text(d) {
+            return true;
+        }
+    }
+    if let Some(errs) = errors {
+        for e in errs {
+            if let Some(ref d) = e.detail {
+                if matches_text(d) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn map_network_error(err: reqwest::Error) -> anyhow::Error {
@@ -587,4 +705,20 @@ fn map_keygen_error(errors: Option<Vec<KeygenError>>, detail: Option<String>) ->
     }
 
     anyhow!(LicenseError::Api("未知 Keygen 错误".to_string()))
+}
+
+impl LicenseScope {
+    fn activation_dir(&self) -> &'static str {
+        match self {
+            LicenseScope::Product => PRODUCT_ACTIVATION_DIR,
+            LicenseScope::Extension => EXT_ACTIVATION_DIR,
+        }
+    }
+}
+
+impl LicenseManager {
+    fn activation_path(&self) -> PathBuf {
+        let dir = self.home.join(self.scope.activation_dir());
+        dir.join(ACTIVATION_FILE)
+    }
 }

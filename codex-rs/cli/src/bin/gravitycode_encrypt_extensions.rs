@@ -93,7 +93,7 @@ fn main() -> Result<()> {
     let packed = pack_extensions(&extensions_dir)?;
     let sha256 = Sha256::digest(&packed);
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut content_key = [0u8; 32];
     rng.fill_bytes(&mut content_key);
     let mut bundle_iv = [0u8; 16];
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     let mut wrap_iv = [0u8; 16];
     rng.fill_bytes(&mut wrap_iv);
     let wrap_ct = encrypt_aes_cbc(&wrap_key, &wrap_iv, &content_key)?;
-    drop(content_key);
+    let _ = content_key;
 
     let wrap = WrapFile {
         version: 1,

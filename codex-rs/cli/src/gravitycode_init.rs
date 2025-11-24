@@ -6,6 +6,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ use cbc::Decryptor;
 use cipher::BlockDecryptMut;
 use cipher::KeyIvInit;
 use cipher::block_padding::Pkcs7;
-use once_cell::sync::OnceCell;
+use flate2::read::GzDecoder;
 use scrypt::Params as ScryptParams;
 use scrypt::scrypt;
 use serde::Deserialize;
@@ -31,8 +32,6 @@ use crate::gravitycode_license::LicenseManager;
 static EXT_BUNDLE: &[u8] = include_bytes!(env!("GRAVITYCODE_EXT_BUNDLE_PATH"));
 #[cfg(gravitycode_ext_encrypted)]
 static EXT_WRAP: &[u8] = include_bytes!(env!("GRAVITYCODE_EXT_WRAP_PATH"));
-
-static CLEANUP_GUARD: OnceCell<DecryptedGuard> = OnceCell::new();
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Embedded extension license key (not read from environment).
@@ -52,20 +51,24 @@ struct EncryptedBundle {
     iv_b64: String,
     ciphertext_b64: String,
     sha256_plain_b64: String,
+    compression: Option<String>,
 }
 
-struct DecryptedGuard {
+/// Removes decrypted extensions when dropped (normal exit).
+pub struct GravitycodeCleanupGuard {
     path: PathBuf,
 }
 
-impl Drop for DecryptedGuard {
+impl Drop for GravitycodeCleanupGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
 /// Initialize GravityCode INS extensions (decrypt when needed).
-pub fn initialize_gravitycode() -> Result<(), Box<dyn std::error::Error>> {
+/// Returns a cleanup guard that will delete the decrypted directory on drop.
+pub async fn initialize_gravitycode()
+-> Result<Option<GravitycodeCleanupGuard>, Box<dyn std::error::Error>> {
     #[cfg(not(gravitycode_ext_encrypted))]
     {
         return Err("GravityCode 加密扩展未嵌入，无法继续".into());
@@ -82,8 +85,10 @@ pub fn initialize_gravitycode() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(&ext_dir)?;
 
         // Validate extension license (separate from application license).
-        let ext_manager = LicenseManager::new()?;
-        ext_manager.ensure_active_with_key(EXT_LICENSE_KEY)?;
+        let ext_manager = LicenseManager::new_for_extension()?;
+        ext_manager
+            .ensure_active_with_key_async(EXT_LICENSE_KEY)
+            .await?;
 
         decrypt_extensions(&ext_dir, EXT_LICENSE_KEY)?;
         fs::write(codex_home.join(".gravitycode-version"), VERSION)?;
@@ -92,10 +97,7 @@ pub fn initialize_gravitycode() -> Result<(), Box<dyn std::error::Error>> {
             env::set_var("INS_KNOWLEDGE_BASE", &ext_dir);
         }
 
-        // Register cleanup on drop.
-        CLEANUP_GUARD.set(DecryptedGuard { path: ext_dir }).ok();
-
-        Ok(())
+        Ok(Some(GravitycodeCleanupGuard { path: ext_dir }))
     }
 }
 
@@ -105,7 +107,10 @@ fn decrypt_extensions(target_dir: &Path, ext_license_key: &str) -> Result<()> {
     let bundle: EncryptedBundle =
         serde_json::from_slice(EXT_BUNDLE).context("解析加密扩展包失败")?;
 
-    if wrap.version != 1 || bundle.version != 1 {
+    if wrap.version != 1 {
+        return Err(anyhow::anyhow!("扩展包 wrap 版本不匹配"));
+    }
+    if bundle.version != 1 && bundle.version != 2 {
         return Err(anyhow::anyhow!("扩展包版本不匹配"));
     }
 
@@ -125,7 +130,12 @@ fn decrypt_extensions(target_dir: &Path, ext_license_key: &str) -> Result<()> {
         .decode(bundle.ciphertext_b64.as_bytes())
         .context("解码 bundle 密文失败")?;
 
-    let plaintext = decrypt_aes256_cbc(&content_key, &bundle_iv, &bundle_ct)?;
+    let decrypted = decrypt_aes256_cbc(&content_key, &bundle_iv, &bundle_ct)?;
+    let plaintext = match bundle.compression.as_deref() {
+        None | Some("") => decrypted,
+        Some("gzip") => decompress_gzip(&decrypted).context("解压 bundle 失败")?,
+        Some(other) => return Err(anyhow::anyhow!("扩展包 compression 不支持: {other}")),
+    };
 
     if !bundle.sha256_plain_b64.is_empty() {
         let expected = BASE64
@@ -140,8 +150,18 @@ fn decrypt_extensions(target_dir: &Path, ext_license_key: &str) -> Result<()> {
     // Plaintext format: repeated blocks => path_len:u32 | content_len:u32 | path bytes | content bytes.
     let mut cursor: &[u8] = &plaintext;
     while cursor.len() >= 8 {
-        let path_len = u32::from_le_bytes(cursor[0..4].try_into().unwrap()) as usize;
-        let content_len = u32::from_le_bytes(cursor[4..8].try_into().unwrap()) as usize;
+        let path_len_bytes: [u8; 4] = cursor
+            .get(0..4)
+            .ok_or_else(|| anyhow::anyhow!("扩展包格式错误: path_len 缺失"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("扩展包格式错误: path_len 长度"))?;
+        let content_len_bytes: [u8; 4] = cursor
+            .get(4..8)
+            .ok_or_else(|| anyhow::anyhow!("扩展包格式错误: content_len 缺失"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("扩展包格式错误: content_len 长度"))?;
+        let path_len = u32::from_le_bytes(path_len_bytes) as usize;
+        let content_len = u32::from_le_bytes(content_len_bytes) as usize;
         if cursor.len() < 8 + path_len + content_len {
             break;
         }
@@ -188,6 +208,16 @@ fn decrypt_aes256_cbc(key: &[u8; 32], iv: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
     cipher
         .decrypt_padded_vec_mut::<Pkcs7>(ct)
         .map_err(|_| anyhow::anyhow!("解密失败"))
+}
+
+#[cfg(gravitycode_ext_encrypted)]
+fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = GzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| anyhow::anyhow!("gzip 解压失败: {e}"))?;
+    Ok(out)
 }
 
 fn get_codex_home() -> Result<PathBuf> {

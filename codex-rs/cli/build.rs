@@ -4,6 +4,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -17,6 +18,8 @@ use cbc::Encryptor;
 use cipher::BlockEncryptMut;
 use cipher::KeyIvInit;
 use cipher::block_padding::Pkcs7;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use rand::RngCore;
 use scrypt::Params as ScryptParams;
 use scrypt::scrypt;
@@ -29,14 +32,15 @@ const WRAP_KDF_SALT: &str = "gravitycode-ext-wrap-v1";
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(gravitycode_ext_encrypted)");
 
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| panic!("CARGO_MANIFEST_DIR not set"));
     let manifest_dir_path = PathBuf::from(manifest_dir);
     let root = manifest_dir_path
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .expect("Cannot compute GravityCode root")
-        .to_path_buf();
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| panic!("Cannot compute GravityCode root"));
 
     let bundle_path = root.join("extensions.bundle.encrypted");
     let wrap_path = root.join("extensions.wrap.json");
@@ -72,7 +76,7 @@ fn main() {
     emit_embed(&bundle_path, &wrap_path);
 }
 
-fn emit_embed(bundle_path: &PathBuf, wrap_path: &PathBuf) {
+fn emit_embed(bundle_path: &Path, wrap_path: &Path) {
     println!("cargo:warning=📦 Using encrypted GravityCode extensions");
     println!("cargo:rerun-if-changed={}", bundle_path.display());
     println!("cargo:rerun-if-changed={}", wrap_path.display());
@@ -96,6 +100,7 @@ fn encrypt_and_write(
 ) -> Result<()> {
     let packed = pack_extensions(extensions_dir)?;
     let sha256 = Sha256::digest(&packed);
+    let compressed = compress_bytes(&packed)?;
 
     let mut rng = rand::thread_rng();
 
@@ -103,10 +108,11 @@ fn encrypt_and_write(
     rng.fill_bytes(&mut content_key);
     let mut bundle_iv = [0u8; 16];
     rng.fill_bytes(&mut bundle_iv);
-    let bundle_ct = encrypt_aes_cbc(&content_key, &bundle_iv, &packed)?;
+    let bundle_ct = encrypt_aes_cbc(&content_key, &bundle_iv, &compressed)?;
 
     let bundle = serde_json::json!({
-        "version": 1,
+        "version": 2,
+        "compression": "gzip",
         "iv_b64": BASE64.encode(bundle_iv),
         "ciphertext_b64": BASE64.encode(bundle_ct),
         "sha256_plain_b64": BASE64.encode(sha256),
@@ -129,11 +135,8 @@ fn encrypt_and_write(
     fs::write(wrap_out, serde_json::to_vec_pretty(&wrap)?)
         .with_context(|| format!("写入 wrap 失败: {}", wrap_out.display()))?;
 
-    let size_mb = (fs::metadata(bundle_out)?.len() as f64) / 1024.0 / 1024.0;
-    println!(
-        "cargo:warning=🌍 GravityCode: 生成并嵌入加密扩展 ({:.2} MB)",
-        size_mb
-    );
+    let size_mb = (compressed.len() as f64) / 1024.0 / 1024.0;
+    println!("cargo:warning=🌍 GravityCode: 生成并嵌入加密扩展 ({size_mb:.2} MB)");
 
     Ok(())
 }
@@ -192,6 +195,12 @@ fn pack_extensions(root: &PathBuf) -> Result<Vec<u8>> {
 fn encrypt_aes_cbc(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = Encryptor::<Aes256>::new_from_slices(key, iv).context("创建加密器失败")?;
     Ok(cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext))
+}
+
+fn compress_bytes(plain: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(plain).context("写入压缩器失败")?;
+    encoder.finish().context("完成压缩失败")
 }
 
 fn derive_wrap_key(license_key: &str) -> Result<[u8; 32]> {

@@ -65,6 +65,7 @@ aes = "0.8"
 base64 = "0.22"
 cbc = { version = "0.1", features = ["alloc"] }
 cipher = { version = "0.4", features = ["alloc"] }
+flate2 = { workspace = true }
 hex = "0.4"
 hostname = "0.4"
 num_cpus = "1.16"
@@ -84,6 +85,7 @@ rand = { workspace = true }
 scrypt = "0.11"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
